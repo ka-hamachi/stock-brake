@@ -1,0 +1,51 @@
+name: 日本株 高値更新モニター
+
+on:
+  schedule:
+    # 東証取引時間 (JST 09:00-15:30) = UTC 00:00-06:30
+    # 毎5分、月曜〜金曜
+    - cron: "0/5 0-6 * * 1-5"
+  workflow_dispatch: # 手動実行用
+
+# 同時実行を防ぐ (前の実行が終わってから次を開始)
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 最新のstate.jsonを取得するためfetchする
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python monitor.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/state.json
+          # 変更がある場合のみコミット
+          git diff --staged --quiet || git commit -m "chore: update state [skip ci]"
+          git push
