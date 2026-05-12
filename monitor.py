@@ -6,6 +6,7 @@ kabutan.jp をスクレイピングして年初来高値・52週高値の更新�
 import json
 import logging
 import os
+import re
 import time
 from datetime import date, datetime
 
@@ -55,7 +56,6 @@ TARGETS = [
 
 def is_market_open() -> bool:
     now = datetime.now(JST)
-    # 土日はスキップ
     if now.weekday() >= 5:
         return False
     m = now.hour * 60 + now.minute
@@ -70,11 +70,13 @@ def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
-        # 日付が変わったらリセット
         if state.get("date") == today:
+            # リスト形式から辞書形式へのマイグレーション
+            for key in ("ytd_high", "w52_high"):
+                if isinstance(state.get(key), list):
+                    state[key] = {code: 0 for code in state[key]}
             return state
-    # 初期状態
-    return {"date": today, "ytd_high": [], "w52_high": []}
+    return {"date": today, "ytd_high": {}, "w52_high": {}}
 
 
 def save_state(state: dict) -> None:
@@ -84,6 +86,14 @@ def save_state(state: dict) -> None:
 
 
 # ── スクレイピング ─────────────────────────────────────────────────────────────────
+
+def parse_price(price_str: str) -> float:
+    """価格文字列を数値に変換。変換失敗時は 0.0 を返す。"""
+    try:
+        return float(re.sub(r"[^\d.]", "", price_str))
+    except (ValueError, AttributeError):
+        return 0.0
+
 
 def scrape_stocks(url: str, table_class: str) -> list[dict]:
     """kabutan.jp の高値更新テーブルから銘柄一覧を取得する"""
@@ -96,7 +106,6 @@ def scrape_stocks(url: str, table_class: str) -> list[dict]:
 
     soup = BeautifulSoup(resp.text, "lxml")
 
-    # テーブルを探す（クラス名が一致するものを優先、なければ最初の大きなテーブル）
     table = soup.find("table", class_=table_class)
     if not table:
         # フォールバック: 銘柄コードリンクを含む最初のテーブル
@@ -110,23 +119,45 @@ def scrape_stocks(url: str, table_class: str) -> list[dict]:
         return []
 
     stocks = []
-    rows = table.find_all("tr")
-    for row in rows[1:]:  # ヘッダー行をスキップ
+    for row in table.find_all("tr")[1:]:
         cells = row.find_all("td")
-        if len(cells) < 2:
+        if len(cells) < 3:
             continue
 
-        # 銘柄コード (リンクまたはテキスト)
-        code_cell = cells[0]
-        link = code_cell.find("a")
-        code = (link or code_cell).get_text(strip=True)
-        if not code:
+        # 銘柄コードを href="/stock/?code=XXXX" から抽出
+        code = None
+        name = None
+        price_col = None
+
+        for i, cell in enumerate(cells):
+            link = cell.find("a", href=lambda h: h and "/stock/?code=" in h)
+            if link:
+                m = re.search(r"code=(\d+)", link.get("href", ""))
+                if not m:
+                    continue
+                code = m.group(1)
+                # 銘柄名: 次のセルにリンクがあればそちら、なければ同セルのテキスト
+                if i + 1 < len(cells):
+                    next_cell = cells[i + 1]
+                    next_link = next_cell.find("a")
+                    if next_link:
+                        name = next_link.get_text(strip=True)
+                        price_col = i + 2
+                    else:
+                        name = link.get_text(strip=True)
+                        price_col = i + 1
+                else:
+                    name = link.get_text(strip=True)
+                    price_col = i + 1
+                break
+
+        if not code or price_col is None:
             continue
 
-        name = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-        price = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-        change = cells[3].get_text(strip=True) if len(cells) > 3 else ""
-        change_pct = cells[4].get_text(strip=True) if len(cells) > 4 else ""
+        n = len(cells)
+        price = cells[price_col].get_text(strip=True) if price_col < n else ""
+        change = cells[price_col + 1].get_text(strip=True) if price_col + 1 < n else ""
+        change_pct = cells[price_col + 2].get_text(strip=True) if price_col + 2 < n else ""
 
         stocks.append({
             "code": code,
@@ -190,18 +221,31 @@ def main() -> None:
         stocks = scrape_stocks(target["url"], target["table_class"])
         logger.info(f"  取得銘柄数: {len(stocks)}")
 
-        already_notified = set(state.get(key, []))
-        new_stocks = [s for s in stocks if s["code"] not in already_notified]
+        # {コード: 最終通知価格} の辞書で管理
+        notified: dict = state.get(key, {})
+        if isinstance(notified, list):
+            notified = {code: 0 for code in notified}
+
+        new_stocks = []
+        for stock in stocks:
+            code = stock["code"]
+            current_price = parse_price(stock["price"])
+            last_price = float(notified.get(code, -1))
+
+            # 未通知 or 前回通知より高い価格なら通知
+            if last_price < 0 or (current_price > 0 and current_price > last_price):
+                new_stocks.append(stock)
+                notified[code] = current_price
+
         logger.info(f"  新規通知対象: {len(new_stocks)} 銘柄")
 
         for stock in new_stocks:
             msg = build_message(stock, target["label"], target["emoji"])
             send_slack(msg)
-            already_notified.add(stock["code"])
             logger.info(f"  通知済み: {stock['code']} {stock['name']}")
             time.sleep(0.3)  # Slack レートリミット対策
 
-        state[key] = list(already_notified)
+        state[key] = notified
         total_new += len(new_stocks)
 
     save_state(state)
